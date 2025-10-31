@@ -1,18 +1,18 @@
 # ====== 調整用パラメータ ======
 CAMERA_FRAME_WIDTH = 1920
 CAMERA_FRAME_HEIGHT = 1080
-MAX_NUM_HANDS = 10
-MIN_DETECTION_CONFIDENCE = 0.8  # 少し下げて検出されやすく
-MIN_TRACKING_CONFIDENCE = 0.5
+MAX_NUM_HANDS = 2            # 同時につかえる手の数
+MIN_DETECTION_CONFIDENCE = 0.7  # 信頼度の下限値 (手の検知)
+MIN_TRACKING_CONFIDENCE = 0.6 # 信頼度の下限値 (トラッキング)
 DRAW_COLOR = (255, 0, 0)
 DRAW_THICKNESS = 10
-ERASER_THICKNESS = 50
 COLOR_RECT_WIDTH = 80
 COLOR_RECT_HEIGHT = 60
-CLEAR_BUTTON_POS = (1150, 10)
-CLEAR_BUTTON_SIZE = (100, 60)
-CLEAR_BUTTON_TEXT = "Clear All"
-
+DRAW_HISTORY_MAX = 20000   # 総描画点の上限
+SMOOTHING_ALPHA = 0.5        # 0～1 (大きいほど最新値を強く反映)
+MAX_JUMP_DISTANCE = 0.30     # 正規化座標での「大ジャンプ」とみなす閾値
+MIN_POINT_DIST_PX = 4        # ピクセル単位で追加する最小距離（不要な密な点を除去）
+INTERP_MAX_DIST_PX = 120      # これ以下の距離なら中間点で補間する（px）
 # --- トラッキング用パラメータ ---
 MATCHING_DISTANCE_THRESHOLD = 0.1  # 手をマッチングする際の最大距離 (画面サイズに対する割合)
 TRACK_LIFETIME = 15                # 手が何フレーム見えなくなったら追跡をやめるか
@@ -22,48 +22,115 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from collections import deque
-import subprocess
-import re
+import platform
 import time
+import threading
+import signal
 
-# (list_cameras_ffmpeg と select_camera 関数は変更なし)
-def list_cameras_ffmpeg():
-    try:
-        result = subprocess.run(
-            ['ffmpeg', '-f', 'avfoundation', '-list_devices', 'true', '-i', '""'],
-            stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True
-        )
-        output = result.stderr
-        camera_list = []
-        in_video_section = False
-        for line in output.splitlines():
-            if "AVFoundation video devices:" in line: in_video_section = True; continue
-            if "AVFoundation audio devices:" in line: in_video_section = False
-            if in_video_section:
-                m = re.search(r'\[(\d+)\] (.+)', line)
-                if m: camera_list.append((int(m.groups()[0]), m.groups()[1].strip()))
-        return camera_list
-    except Exception as e:
-        print("カメラ一覧の取得に失敗しました:", e); return []
+# ====== カメラ列挙（Windowsは名称取得対応） ======
+def list_cameras(max_index=10):
+    is_windows = platform.system() == 'Windows'
+    backend = cv2.CAP_DSHOW if is_windows else 0
+    available = []
+    for i in range(max_index + 1):
+        cap = cv2.VideoCapture(i, backend) if is_windows else cv2.VideoCapture(i)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                available.append(i)
+        cap.release()
+    return available
+
+def list_cameras_with_names(max_index=10):
+    is_windows = platform.system() == 'Windows'
+    if is_windows:
+        try:
+            # DirectShowの列挙順に名称を取得
+            from pygrabber.dshow_graph import FilterGraph
+            names = FilterGraph().get_input_devices()  # list[str]
+            available = []
+            for i, name in enumerate(names):
+                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    ok, _ = cap.read()
+                    if ok:
+                        available.append((i, name))
+                cap.release()
+            return available
+        except Exception:
+            pass  # フォールバックに移行
+    # 非Windows or 失敗時は番号のみ
+    idx = list_cameras(max_index)
+    return [(i, f"Camera {i}") for i in idx]
 
 def select_camera():
-    cameras = list_cameras_ffmpeg()
-    if not cameras: print("利用可能なWebカメラが見つかりませんでした。"); return None
-    print("利用可能なカメラ一覧:")
-    for idx, name in cameras: print(f"{idx}: {name}")
+    cams = list_cameras_with_names(10)
+    if not cams:
+        print("利用可能なWebカメラが見つかりませんでした。")
+        return None, None
+    print("利用可能なカメラ:")
+    for i, name in cams:
+        print(f"  {i}: {name}")
+    default_cam = cams[0][0]
     while True:
         try:
-            default_cam = cameras[0][0] if cameras else 0
-            selected_str = input(f"使用するカメラ番号を入力してください [{default_cam}]: ")
-            selected = int(selected_str or default_cam)
-            if any(idx == selected for idx, _ in cameras): return selected
-            else: print("リストにある番号を入力してください。")
-        except ValueError: print("数字を入力してください。")
+            s = input(f"使用するカメラ番号を入力してください [{default_cam}]: ").strip()
+            selected = int(s) if s else default_cam
+            valid_indices = [i for i, _ in cams]
+            if selected in valid_indices:
+                # 選択した名称を解決
+                selected_name = dict(cams)[selected]
+                return selected, selected_name
+            print("リストにある番号を入力してください。")
+        except ValueError:
+            print("数字を入力してください。")
 
-def ar_drawing_game(camera_index):
+class VideoCaptureThread:
+    def __init__(self, src=0, backend=None):
+        self.src = src
+        self.backend = backend
+        if backend is not None:
+            self.cap = cv2.VideoCapture(src, backend)
+        else:
+            self.cap = cv2.VideoCapture(src)
+        self.stopped = False
+        self.lock = threading.Lock()
+        self.frame = None
+        # プリウォームして1フレーム確保
+        ret, f = self.cap.read()
+        if ret:
+            self.frame = f
+
+    def start(self):
+        t = threading.Thread(target=self.update, daemon=True)
+        t.start()
+        return self
+
+    def update(self):
+        while not self.stopped:
+            ret, f = self.cap.read()
+            if not ret:
+                time.sleep(0.005)
+                continue
+            with self.lock:
+                self.frame = f
+
+    def read(self):
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+
+    def release(self):
+        self.stopped = True
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
+def ar_drawing_game(camera_index, camera_name=""):
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         max_num_hands=MAX_NUM_HANDS,
+        model_complexity=0,         # 軽量モデル
         min_detection_confidence=MIN_DETECTION_CONFIDENCE,
         min_tracking_confidence=MIN_TRACKING_CONFIDENCE
     )
@@ -72,23 +139,42 @@ def ar_drawing_game(camera_index):
     draw_color = DRAW_COLOR
 
     # --- トラッキング管理用の変数 ---
-    tracked_hands = {}  # {track_id: data} 形式の辞書
-    next_track_id = 0   # 次に割り当てる一意のID
-    frame_count = 0     # フレームカウンター
+    tracked_hands = {}
+    next_track_id = 0
+    frame_count = 0
+    persistent_strokes = deque(maxlen=DRAW_HISTORY_MAX)
 
-    cap = cv2.VideoCapture(camera_index)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_FRAME_HEIGHT)
+    is_windows = platform.system() == 'Windows'
+    backend = cv2.CAP_DSHOW if is_windows else None
+    # キャプチャをスレッド化して待ち時間削減
+    vc_thread = VideoCaptureThread(camera_index, backend).start()
+
+    window_title = f"AR Drawing Game - {camera_name}" if camera_name else "AR Drawing Game"
+
+    # --- graceful shutdown handling ---
+    running = True
+
+    def _handle_signal(sig, frame):
+        nonlocal running
+        running = False
+
+    try:
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+    except Exception:
+        # signal may fail on some platforms/threads; ignore
+        pass
 
     colors = {"blue": (255, 0, 0), "green": (0, 255, 0), "red": (0, 0, 255), "yellow": (0, 255, 255)}
     color_rects = []
     for i, (name, bgr) in enumerate(colors.items()):
         color_rects.append({"name": name, "pos": (i * (COLOR_RECT_WIDTH + 10) + 20, 10), "size": (COLOR_RECT_WIDTH, COLOR_RECT_HEIGHT), "bgr": bgr})
-    clear_button = {"pos": CLEAR_BUTTON_POS, "size": CLEAR_BUTTON_SIZE, "text": CLEAR_BUTTON_TEXT}
 
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success: break
+    while True:
+        frame = vc_thread.read()
+        if frame is None:
+            time.sleep(0.01)
+            continue
         frame_count += 1
         frame = cv2.flip(frame, 1)
         h, w, c = frame.shape
@@ -101,26 +187,21 @@ def ar_drawing_game(camera_index):
         current_detected_hands = []
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
-                # 手首の座標を正規化された座標(0.0-1.0)で取得
                 wrist_pos = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST]
                 current_detected_hands.append({'landmarks': hand_landmarks, 'pos': np.array([wrist_pos.x, wrist_pos.y]), 'matched': False})
 
         # --- トラッキングとマッチング処理 ---
         unmatched_detections = list(range(len(current_detected_hands)))
-        
-        # 1. 既存のトラックと今回の検出結果をマッチング
-        for track_id, track_data in tracked_hands.items():
+
+        for track_id, track_data in list(tracked_hands.items()):
             best_match_idx = -1
             min_dist = MATCHING_DISTANCE_THRESHOLD
-            
             for i in unmatched_detections:
                 dist = np.linalg.norm(track_data['pos'] - current_detected_hands[i]['pos'])
                 if dist < min_dist:
                     min_dist = dist
                     best_match_idx = i
-            
             if best_match_idx != -1:
-                # マッチ成功
                 detection = current_detected_hands[best_match_idx]
                 track_data['pos'] = detection['pos']
                 track_data['landmarks'] = detection['landmarks']
@@ -128,7 +209,6 @@ def ar_drawing_game(camera_index):
                 detection['matched'] = True
                 unmatched_detections.remove(best_match_idx)
 
-        # 2. マッチしなかった検出結果を新しいトラックとして追加
         for i in unmatched_detections:
             detection = current_detected_hands[i]
             tracked_hands[next_track_id] = {
@@ -136,15 +216,21 @@ def ar_drawing_game(camera_index):
                 'landmarks': detection['landmarks'],
                 'last_seen': frame_count,
                 'deque': deque(maxlen=5000),
-                'prev_drawing': False
+                'prev_drawing': False,
+                'smoothed_index': detection['pos'].copy()
             }
             next_track_id += 1
 
         # --- 手ごとのジェスチャー認識と描画 ---
         active_track_ids = list(tracked_hands.keys())
         for track_id in active_track_ids:
-            # 3. 長時間見失ったトラックを削除
             if frame_count - tracked_hands[track_id]['last_seen'] > TRACK_LIFETIME:
+                # 手の追跡が切れたら、その手のdequeをグローバル履歴に移してから削除
+                td = tracked_hands[track_id]
+                # dequeは newest が先頭になっているので、古い順にして永続履歴へ追加
+                points = list(td['deque'])[::-1]
+                for p in points:
+                    persistent_strokes.append(p)
                 del tracked_hands[track_id]
                 continue
 
@@ -154,58 +240,143 @@ def ar_drawing_game(camera_index):
             thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
             index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
             middle_tip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
-            ix, iy = int(index_tip.x * w), int(index_tip.y * h)
+
+            # --- 指先の平滑化 (EMA) と大ジャンプ検出 ---
+            current_index_norm = np.array([index_tip.x, index_tip.y])
+            if 'smoothed_index' not in track_data or track_data['smoothed_index'] is None:
+                track_data['smoothed_index'] = current_index_norm.copy()
+
+            dist_norm = np.linalg.norm(track_data['smoothed_index'] - current_index_norm)
+            if dist_norm > MAX_JUMP_DISTANCE:
+                # 大ジャンプ -> ストロークを分断して平滑位置をリセット
+                if track_data.get('prev_drawing', False):
+                    track_data['deque'].appendleft(None)
+                track_data['smoothed_index'] = current_index_norm.copy()
+            else:
+                alpha = SMOOTHING_ALPHA
+                track_data['smoothed_index'] = (1 - alpha) * track_data['smoothed_index'] + alpha * current_index_norm
+
+            smoothed_index = track_data['smoothed_index']
+            ix, iy = int(smoothed_index[0] * w), int(smoothed_index[1] * h)
+
             index_is_up = index_tip.y < hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
             middle_is_up = middle_tip.y < hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y
 
             drawing = False
-            
-            # どの手でも色選択・消去できるように変更
+
+            # 指1本（人差し指のみ）で色選択（平滑後座標を使用）
             if index_is_up and not middle_is_up:
                 cv2.circle(frame, (ix, iy), 15, (255, 255, 0), 3)
-                if clear_button["pos"][0] < ix < clear_button["pos"][0] + clear_button["size"][0] and clear_button["pos"][1] < iy < clear_button["pos"][1] + clear_button["size"][1]:
-                    for t_id in tracked_hands: tracked_hands[t_id]['deque'].clear()
-                else:
-                    for r in color_rects:
-                        if r["pos"][0] < ix < r["pos"][0] + r["size"][0] and r["pos"][1] < iy < r["pos"][1] + r["size"][1]:
-                            draw_color = r["bgr"]
-            
+                for r in color_rects:
+                    if r["pos"][0] < ix < r["pos"][0] + r["size"][0] and r["pos"][1] < iy < r["pos"][1] + r["size"][1]:
+                        draw_color = r["bgr"]
+
+            # 親指と人差し指の距離で描画ON（距離判定は元の正規化座標）
             distance = np.linalg.norm(np.array([thumb_tip.x, thumb_tip.y]) - np.array([index_tip.x, index_tip.y]))
-            if distance < 0.05: # 正規化座標での距離判定
-                track_data['deque'].appendleft(((ix, iy), draw_color, DRAW_THICKNESS))
-                drawing = True
+            if distance < 0.05:
+                # 最小ピクセル距離を満たすかを確認して追加（過密点を除去）
+                last_point = None
+                if track_data['deque']:
+                    if track_data['deque'][0] is not None:
+                        last_point = track_data['deque'][0][0]
+
+                should_add = True
+                if last_point is not None:
+                    dx = ix - last_point[0]
+                    dy = iy - last_point[1]
+                    dist_px = (dx * dx + dy * dy) ** 0.5
+                    if dist_px < MIN_POINT_DIST_PX:
+                        should_add = False
+
+                if should_add:
+                    # ---------- ここから補間処理 ----------
+                    if last_point is not None:
+                        dx = ix - last_point[0]
+                        dy = iy - last_point[1]
+                        dist_px = (dx * dx + dy * dy) ** 0.5
+                        if dist_px > INTERP_MAX_DIST_PX:
+                            # ピクセル単位の大ジャンプ：ストロークを分断
+                            track_data['deque'].appendleft(None)
+                        else:
+                            # 線形補間で中間点を埋める（間隔は MIN_POINT_DIST_PX）
+                            steps = max(1, int(dist_px / MIN_POINT_DIST_PX))
+                            # 中間点を古い順 -> 新しい順に作成してから appendleft する
+                            inter_points = []
+                            for s in range(1, steps):
+                                t = s / steps
+                                xi = int(last_point[0] + t * dx)
+                                yi = int(last_point[1] + t * dy)
+                                inter_points.append(((xi, yi), draw_color, DRAW_THICKNESS))
+                            # appendleft するときは古い順から行い、最後に最新点を追加
+                            for p in reversed(inter_points):
+                                track_data['deque'].appendleft(p)
+                    # 実点を追加（常に追加）
+                    track_data['deque'].appendleft(((ix, iy), draw_color, DRAW_THICKNESS))
+                    drawing = True
+                    # ---------- 補間処理ここまで ----------
 
             if track_data['prev_drawing'] and not drawing:
                 track_data['deque'].appendleft(None)
             track_data['prev_drawing'] = drawing
-            
-            # IDを画面に表示
-            # cv2.putText(frame, f"ID:{track_id}", (int(track_data['pos'][0] * w), int(track_data['pos'][1] * h)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            # mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-            
+
         # --- UIと軌跡の描画 ---
         for r in color_rects:
             cv2.rectangle(frame, r["pos"], (r["pos"][0] + r["size"][0], r["pos"][1] + r["size"][1]), r["bgr"], -1)
-            if r["bgr"] == draw_color: cv2.rectangle(frame, r["pos"], (r["pos"][0] + r["size"][0], r["pos"][1] + r["size"][1]), (255,255,255), 4)
-        cv2.rectangle(frame, clear_button["pos"], (clear_button["pos"][0]+clear_button["size"][0], clear_button["pos"][1]+clear_button["size"][1]), (180,180,180), -1)
-        cv2.putText(frame, clear_button["text"], (clear_button["pos"][0]+10, clear_button["pos"][1]+40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+            if r["bgr"] == draw_color:
+                cv2.rectangle(frame, r["pos"], (r["pos"][0] + r["size"][0], r["pos"][1] + r["size"][1]), (255, 255, 255), 4)
+
+        # カメラ名を表示
+        # if camera_name:
+        #     cv2.putText(frame, f"Camera: {camera_name}", (20, COLOR_RECT_HEIGHT + 40),
+        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (240, 240, 240), 2, cv2.LINE_AA)
 
         for track_data in tracked_hands.values():
             dq = track_data['deque']
             for i in range(1, len(dq)):
                 if dq[i - 1] is not None and dq[i] is not None:
-                    p1, color1, thick1 = dq[i-1]
+                    p1, color1, thick1 = dq[i - 1]
                     p2, color2, thick2 = dq[i]
                     cv2.line(frame, p1, p2, color1, thick1)
 
-        cv2.imshow('AR Drawing Game', frame)
-        if cv2.waitKey(5) & 0xFF == ord('q'): break
+        ps = list(persistent_strokes)
+        for i in range(1, len(ps)):
+            if ps[i - 1] is not None and ps[i] is not None:
+                p1, color1, thick1 = ps[i - 1]
+                p2, color2, thick2 = ps[i]
+                cv2.line(frame, p1, p2, color1, thick1)
 
+        # --- フレームを拡大して表示 ---
+        scale_factor = 1.5  # ウィンドウの拡大倍率
+        frame_resized = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_LINEAR)
+
+        cv2.imshow(window_title, frame_resized)
+        key = cv2.waitKey(5) & 0xFF
+        if key == ord('q'):
+            break
+        if key == 32:  # スペースキーで全消去
+            for t_id in tracked_hands:
+                tracked_hands[t_id]['deque'].clear()
+            persistent_strokes.clear()
+        # ウィンドウのバツボタンやシグナルでの終了要求を検出
+        # getWindowProperty が 0 未満や 0 の場合はウィンドウが閉じられた
+        try:
+            if cv2.getWindowProperty(window_title, cv2.WND_PROP_VISIBLE) < 1:
+                break
+        except Exception:
+            # 一部環境では例外が出ることがあるが、その場合は安全に終了
+            break
+        if not running:
+            break
+
+    # release resources
+    try:
+        vc_thread.release()
+    except Exception:
+        pass
     hands.close()
-    cap.release()
     cv2.destroyAllWindows()
 
 if __name__ == '__main__':
-    selected_camera_index = select_camera()
+    selected_camera_index, camera_name = select_camera()
     if selected_camera_index is not None:
-        ar_drawing_game(selected_camera_index)
+        ar_drawing_game(selected_camera_index, camera_name)
