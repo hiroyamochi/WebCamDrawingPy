@@ -351,8 +351,8 @@ def ar_drawing_game(camera_index, camera_name=""):
 
         cv2.imshow(window_title, frame_resized)
         key = cv2.waitKey(5) & 0xFF
-        if key == ord('q'):
-            break
+        # if key == ord('q'):
+        #     break
         if key == 32:  # スペースキーで全消去
             for t_id in tracked_hands:
                 tracked_hands[t_id]['deque'].clear()
