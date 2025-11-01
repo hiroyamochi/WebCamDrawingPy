@@ -3,16 +3,29 @@ CAMERA_FRAME_WIDTH = 1920
 CAMERA_FRAME_HEIGHT = 1080
 MAX_NUM_HANDS = 2            # 同時につかえる手の数
 MIN_DETECTION_CONFIDENCE = 0.7  # 信頼度の下限値 (手の検知)
-MIN_TRACKING_CONFIDENCE = 0.6 # 信頼度の下限値 (トラッキング)
+MIN_TRACKING_CONFIDENCE = 0.6   # 信頼度の下限値 (トラッキング)
+
+# 描画系
 DRAW_COLOR = (255, 0, 0)
 DRAW_THICKNESS = 10
+DRAW_HISTORY_MAX = 20000        # 総描画点の上限
+SMOOTHING_ALPHA = 0.35          # 0～1 (大きいほど最新値を強く反映)
+MIN_POINT_DIST_PX = 4           # ピクセル単位で追加する最小距離（不要な密な点を除去）
+INTERP_MAX_DIST_PX = 120        # これ以下の距離なら中間点で補間（px）
+MAX_JUMP_DISTANCE = 0.30        # 正規化座標での「大ジャンプ」分断閾値
+
+# カラーパレットUI
 COLOR_RECT_WIDTH = 80
 COLOR_RECT_HEIGHT = 60
-DRAW_HISTORY_MAX = 20000   # 総描画点の上限
-SMOOTHING_ALPHA = 0.5        # 0～1 (大きいほど最新値を強く反映)
-MAX_JUMP_DISTANCE = 0.30     # 正規化座標での「大ジャンプ」とみなす閾値
-MIN_POINT_DIST_PX = 4        # ピクセル単位で追加する最小距離（不要な密な点を除去）
-INTERP_MAX_DIST_PX = 120      # これ以下の距離なら中間点で補間する（px）
+COLOR_HOVER_FRAMES = 6          # パレット上でこのフレーム数滞留で色変更（デバウンス）
+
+# ジェスチャ判定（ヒステリシスあり）
+PINCH_ON_DIST = 0.045           # 親指-人差し指の距離（正規化）でON
+PINCH_OFF_DIST = 0.065          # OFFに戻す距離（> ONより大きく）
+PINCH_ON_FRAMES = 3             # ON確定に必要な連続フレーム
+PINCH_OFF_FRAMES = 3            # OFF確定に必要な連続フレーム
+FINGER_UP_MARGIN = 0.015        # tip が pip よりどれだけ上なら「伸びている」とするか
+
 # --- トラッキング用パラメータ ---
 MATCHING_DISTANCE_THRESHOLD = 0.1  # 手をマッチングする際の最大距離 (画面サイズに対する割合)
 TRACK_LIFETIME = 15                # 手が何フレーム見えなくなったら追跡をやめるか
@@ -26,6 +39,61 @@ import platform
 import time
 import threading
 import signal
+import os
+import sys
+import contextlib
+
+# OpenCV 自身のログは抑制（外部DLL由来の出力は別途サプレッサで対応）
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+except Exception:
+    pass
+
+# ====== ユーティリティ ======
+def inside_rect(xy, rect_pos, rect_size):
+    x, y = xy
+    rx, ry = rect_pos
+    rw, rh = rect_size
+    return (rx < x < rx + rw) and (ry < y < ry + rh)
+
+def is_finger_up(landmarks, tip_idx, pip_idx, margin=FINGER_UP_MARGIN):
+    """tip が pip より十分上（yが小さい）なら True。
+    MediaPipe の座標系は y が下向きに増えるので注意。
+    """
+    tip = landmarks.landmark[tip_idx]
+    pip = landmarks.landmark[pip_idx]
+    return (tip.y + margin) < pip.y
+
+@contextlib.contextmanager
+def suppress_console_output():
+    """標準出力/標準エラーをOSレベルで一時的に/dev/nullへ。
+    外部DLLが吐くI/W/Eログも可能な範囲で抑制する。
+    """
+    try:
+        # Pythonのストリーム
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        devnull = open(os.devnull, 'w')
+        # OSのファイルディスクリプタを退避
+        old_stdout_fd = os.dup(1)
+        old_stderr_fd = os.dup(2)
+        os.dup2(devnull.fileno(), 1)
+        os.dup2(devnull.fileno(), 2)
+        sys.stdout = devnull
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            # 元に戻す
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            os.dup2(old_stdout_fd, 1)
+            os.dup2(old_stderr_fd, 2)
+            os.close(old_stdout_fd)
+            os.close(old_stderr_fd)
+            devnull.close()
+    except Exception:
+        # 何かあれば単に素通し
+        yield
 
 # ====== カメラ列挙（Windowsは名称取得対応） ======
 def list_cameras(max_index=10):
@@ -33,12 +101,13 @@ def list_cameras(max_index=10):
     backend = cv2.CAP_DSHOW if is_windows else 0
     available = []
     for i in range(max_index + 1):
-        cap = cv2.VideoCapture(i, backend) if is_windows else cv2.VideoCapture(i)
-        if cap.isOpened():
-            ok, _ = cap.read()
-            if ok:
-                available.append(i)
-        cap.release()
+        with suppress_console_output():
+            cap = cv2.VideoCapture(i, backend) if is_windows else cv2.VideoCapture(i)
+            if cap.isOpened():
+                ok, _ = cap.read()
+                if ok:
+                    available.append(i)
+            cap.release()
     return available
 
 def list_cameras_with_names(max_index=10):
@@ -50,12 +119,13 @@ def list_cameras_with_names(max_index=10):
             names = FilterGraph().get_input_devices()  # list[str]
             available = []
             for i, name in enumerate(names):
-                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-                if cap.isOpened():
-                    ok, _ = cap.read()
-                    if ok:
-                        available.append((i, name))
-                cap.release()
+                with suppress_console_output():
+                    cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                    if cap.isOpened():
+                        ok, _ = cap.read()
+                        if ok:
+                            available.append((i, name))
+                    cap.release()
             return available
         except Exception:
             pass  # フォールバックに移行
@@ -89,15 +159,17 @@ class VideoCaptureThread:
     def __init__(self, src=0, backend=None):
         self.src = src
         self.backend = backend
-        if backend is not None:
-            self.cap = cv2.VideoCapture(src, backend)
-        else:
-            self.cap = cv2.VideoCapture(src)
+        with suppress_console_output():
+            if backend is not None:
+                self.cap = cv2.VideoCapture(src, backend)
+            else:
+                self.cap = cv2.VideoCapture(src)
         self.stopped = False
         self.lock = threading.Lock()
         self.frame = None
         # プリウォームして1フレーム確保
-        ret, f = self.cap.read()
+        with suppress_console_output():
+            ret, f = self.cap.read()
         if ret:
             self.frame = f
 
@@ -128,14 +200,13 @@ class VideoCaptureThread:
 
 def ar_drawing_game(camera_index, camera_name=""):
     mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        max_num_hands=MAX_NUM_HANDS,
-        model_complexity=0,         # 軽量モデル
-        min_detection_confidence=MIN_DETECTION_CONFIDENCE,
-        min_tracking_confidence=MIN_TRACKING_CONFIDENCE
-    )
-    mp_drawing = mp.solutions.drawing_utils
-
+    with suppress_console_output():
+        hands = mp_hands.Hands(
+            max_num_hands=MAX_NUM_HANDS,
+            model_complexity=0,         # 軽量モデル
+            min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE
+        )
     draw_color = DRAW_COLOR
 
     # --- トラッキング管理用の変数 ---
@@ -217,7 +288,14 @@ def ar_drawing_game(camera_index, camera_name=""):
                 'last_seen': frame_count,
                 'deque': deque(maxlen=5000),
                 'prev_drawing': False,
-                'smoothed_index': detection['pos'].copy()
+                'smoothed_index': detection['pos'].copy(),
+                # ヒステリシス付きピンチ状態
+                'pinched': False,
+                'pinch_on_count': 0,
+                'pinch_off_count': 0,
+                # カラー選択のデバウンス
+                'hover_target': None,
+                'hover_count': 0
             }
             next_track_id += 1
 
@@ -240,6 +318,8 @@ def ar_drawing_game(camera_index, camera_name=""):
             thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
             index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
             middle_tip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+            ring_tip = hand_landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_TIP]
+            pinky_tip = hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_TIP]
 
             # --- 指先の平滑化 (EMA) と大ジャンプ検出 ---
             current_index_norm = np.array([index_tip.x, index_tip.y])
@@ -259,21 +339,69 @@ def ar_drawing_game(camera_index, camera_name=""):
             smoothed_index = track_data['smoothed_index']
             ix, iy = int(smoothed_index[0] * w), int(smoothed_index[1] * h)
 
-            index_is_up = index_tip.y < hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
-            middle_is_up = middle_tip.y < hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_PIP].y
+            index_is_up = is_finger_up(hand_landmarks,
+                                       mp_hands.HandLandmark.INDEX_FINGER_TIP,
+                                       mp_hands.HandLandmark.INDEX_FINGER_PIP)
+            middle_is_up = is_finger_up(hand_landmarks,
+                                        mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
+                                        mp_hands.HandLandmark.MIDDLE_FINGER_PIP)
+            ring_is_up = is_finger_up(hand_landmarks,
+                                      mp_hands.HandLandmark.RING_FINGER_TIP,
+                                      mp_hands.HandLandmark.RING_FINGER_PIP)
+            pinky_is_up = is_finger_up(hand_landmarks,
+                                       mp_hands.HandLandmark.PINKY_TIP,
+                                       mp_hands.HandLandmark.PINKY_PIP)
 
             drawing = False
 
-            # 指1本（人差し指のみ）で色選択（平滑後座標を使用）
-            if index_is_up and not middle_is_up:
-                cv2.circle(frame, (ix, iy), 15, (255, 255, 0), 3)
+            # --- カラー選択（人差し指のみを伸ばす） ---
+            only_index_up = index_is_up and not (middle_is_up or ring_is_up or pinky_is_up)
+            if only_index_up and not track_data.get('pinched', False):
+                cv2.circle(frame, (ix, iy), 14, (255, 255, 0), 2)
+                # どのパレットにいるか判定
+                hover = None
                 for r in color_rects:
-                    if r["pos"][0] < ix < r["pos"][0] + r["size"][0] and r["pos"][1] < iy < r["pos"][1] + r["size"][1]:
-                        draw_color = r["bgr"]
+                    if inside_rect((ix, iy), r["pos"], r["size"]):
+                        hover = r["name"]
+                        break
+                if hover is not None:
+                    if track_data['hover_target'] == hover:
+                        track_data['hover_count'] += 1
+                    else:
+                        track_data['hover_target'] = hover
+                        track_data['hover_count'] = 1
+                    if track_data['hover_count'] >= COLOR_HOVER_FRAMES:
+                        # 実際の色変更
+                        for r in color_rects:
+                            if r['name'] == hover:
+                                draw_color = r['bgr']
+                                break
+                        track_data['hover_count'] = 0
+                else:
+                    track_data['hover_target'] = None
+                    track_data['hover_count'] = 0
+            else:
+                track_data['hover_target'] = None
+                track_data['hover_count'] = 0
 
-            # 親指と人差し指の距離で描画ON（距離判定は元の正規化座標）
+            # --- ピンチ（つまみ）で描画ON：ヒステリシス＋連続フレーム判定 ---
             distance = np.linalg.norm(np.array([thumb_tip.x, thumb_tip.y]) - np.array([index_tip.x, index_tip.y]))
-            if distance < 0.05:
+            if distance < PINCH_ON_DIST:
+                track_data['pinch_on_count'] += 1
+                track_data['pinch_off_count'] = 0
+                if not track_data['pinched'] and track_data['pinch_on_count'] >= PINCH_ON_FRAMES:
+                    track_data['pinched'] = True
+            elif distance > PINCH_OFF_DIST:
+                track_data['pinch_off_count'] += 1
+                track_data['pinch_on_count'] = 0
+                if track_data['pinched'] and track_data['pinch_off_count'] >= PINCH_OFF_FRAMES:
+                    track_data['pinched'] = False
+            else:
+                # ヒステリシス帯ではカウンタを小さく減衰させる
+                track_data['pinch_on_count'] = max(0, track_data['pinch_on_count'] - 1)
+                track_data['pinch_off_count'] = max(0, track_data['pinch_off_count'] - 1)
+
+            if track_data['pinched']:
                 # 最小ピクセル距離を満たすかを確認して追加（過密点を除去）
                 last_point = None
                 if track_data['deque']:
@@ -357,6 +485,14 @@ def ar_drawing_game(camera_index, camera_name=""):
             for t_id in tracked_hands:
                 tracked_hands[t_id]['deque'].clear()
             persistent_strokes.clear()
+        # 数字キーで色変更（1:青 2:緑 3:赤 4:黄）
+        if key in (ord('1'), ord('2'), ord('3'), ord('4')):
+            key_to_name = {ord('1'): 'blue', ord('2'): 'green', ord('3'): 'red', ord('4'): 'yellow'}
+            name = key_to_name.get(key)
+            for r in color_rects:
+                if r['name'] == name:
+                    draw_color = r['bgr']
+                    break
         # ウィンドウのバツボタンやシグナルでの終了要求を検出
         # getWindowProperty が 0 未満や 0 の場合はウィンドウが閉じられた
         try:
