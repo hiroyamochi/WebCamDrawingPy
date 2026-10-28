@@ -2,26 +2,31 @@
 CAMERA_SIZE = (1920, 1080)      # 要求するカメラ解像度（非対応なら近い値になる）
 MAX_CAMERA_PROBE = 10           # カメラ名が取れないときに探す番号の数
 MAX_NUM_HANDS = 2               # 同時につかえる手の数
-MIN_DETECTION_CONFIDENCE = 0.7  # 信頼度の下限値 (手の検知)
-MIN_TRACKING_CONFIDENCE = 0.6   # 信頼度の下限値 (トラッキング)
+# 信頼度の下限値。高いと、つまんで指先が隠れたときなどに手を見失いやすい
+MIN_DETECTION_CONFIDENCE = 0.5  # 手の検知
+MIN_PRESENCE_CONFIDENCE = 0.5   # 手がまだ映っているか
+MIN_TRACKING_CONFIDENCE = 0.5   # トラッキング
 
 # 描画系（ピクセル値は 720p 基準。実際の解像度に合わせて拡大縮小する）
 DRAW_THICKNESS = 10
 MIN_POINT_DIST_PX = 3           # これ未満の移動では線を伸ばさない（過密な点を除去）
-MAX_STROKE_JUMP_PX = 150        # これを超える移動はストロークを分断
+MAX_STROKE_JUMP_PX = 150        # 1フレームでこれを超える移動はストロークを分断
 
-# 指先の平滑化（One Euro Filter）
+# ペン先の平滑化（One Euro Filter）
 FILTER_MIN_CUTOFF = 1.5         # 小さいほど静止時の手ぶれを抑える
 FILTER_BETA = 0.01              # 大きいほど速い動きへの遅れを減らす
 
 # ジェスチャ判定（ヒステリシスあり / 3D距離を手のひらの大きさに対する比で判定）
+# 実測ではつまむと 0.25～0.37（正面・横向きとも）、開くと 0.49 以上
 PINCH_LEVEL = 5                 # 操作検出感度の初期値（1～10, ↑↓キーで変更 / 大きいほど甘い）
 PINCH_LEVEL_MAX = 10
-PINCH_RATIO_BASE = 0.12         # 親指-人差し指の距離が BASE + STEP * 感度 未満でON
-PINCH_RATIO_STEP = 0.03
-PINCH_OFF_MARGIN = 0.16         # ON の比にこれを足した値を超えたらOFF
+PINCH_RATIO_BASE = 0.20         # 親指-人差し指の距離が BASE + STEP * 感度 未満でON（初期値で 0.40）
+PINCH_RATIO_STEP = 0.04
+PINCH_OFF_MARGIN = 0.12         # ON の比にこれを足した値を超えたらOFF
+PINCH_PAUSE_MARGIN = 0.06       # ON の比にこれを足した値を超えたら（OFF確定前でも）線の延長を止める
 PINCH_ON_FRAMES = 3             # ON確定に必要な連続フレーム
-PINCH_OFF_FRAMES = 3            # OFF確定に必要な連続フレーム
+PINCH_OFF_FRAMES = 4            # OFF確定に必要な連続フレーム
+PINCH_SMOOTHING = 0.5           # 距離の比の平滑化（0～1, 小さいほど強くならす）
 
 # UI（720p 基準）
 SWATCH_SIZE = 64
@@ -30,8 +35,8 @@ TEXT_SIZE = 16
 SELECT_DWELL_SEC = 0.4          # 色の上にこの秒数とどまると選択
 CLEAR_DWELL_SEC = 1.0           # 消去ボタンの上にこの秒数とどまると全消去
 
-# トラッキング（指先基準）
-MATCHING_DISTANCE = 0.15        # 前フレームの指先と同じ手とみなす最大距離（画面幅に対する割合）
+# トラッキング（ペン先 = 親指と人差し指の指先の中点 を基準）
+MATCHING_DISTANCE = 0.25        # 予測したペン先位置と同じ手とみなす最大距離（画面幅に対する割合）
 TRACK_LIFETIME = 8              # 手が何フレーム見えなくなったら追跡をやめるか
 # ============================
 
@@ -215,7 +220,7 @@ def create_landmarker():
         running_mode=vision.RunningMode.VIDEO,
         num_hands=MAX_NUM_HANDS,
         min_hand_detection_confidence=MIN_DETECTION_CONFIDENCE,
-        min_hand_presence_confidence=MIN_DETECTION_CONFIDENCE,
+        min_hand_presence_confidence=MIN_PRESENCE_CONFIDENCE,
         min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
     )
     with suppress_native_output():
@@ -225,10 +230,14 @@ def create_landmarker():
 class HandTrack:
     def __init__(self):
         self.filter = OneEuroFilter(FILTER_MIN_CUTOFF, FILTER_BETA)
-        self.tip = None          # 生の指先位置（マッチング用）
-        self.pos = None          # 平滑化した指先位置（描画用）
+        self.tip = None          # 生のペン先位置（マッチング用）
+        self.vel = np.zeros(2)   # ペン先の速度（px/フレーム, マッチング時の位置予測用）
+        self.pos = None          # 平滑化したペン先位置（描画用）
         self.missed = 0
+        self.gap = 1             # 前回見えてから何フレームたったか
+        self.ratio = None        # 平滑化したピンチ比
         self.pinched = False
+        self.pen_paused = False  # ピンチ中だが指が開きかけていて線を伸ばさない
         self.on_count = 0
         self.off_count = 0
         self.last_pt = None      # 描画中ストロークの最終点
@@ -238,12 +247,21 @@ class HandTrack:
 
     def update(self, det, t, pinch_level):
         tip, ratio = det
+        self.gap = self.missed + 1
+        if self.tip is not None:
+            self.vel = 0.5 * self.vel + 0.5 * (tip - self.tip) / self.gap
         self.tip = tip
         self.pos = self.filter(tip, t)
         self.missed = 0
 
-        # ピンチ（つまみ）判定
         on_ratio = PINCH_RATIO_BASE + PINCH_RATIO_STEP * pinch_level
+        # 指が開き始めたら OFF 確定を待たずに線の延長だけ止める（離すときの余計な線を防ぐ）。
+        # ピンチ状態は保つので、一瞬の揺れなら次のフレームでそのまま線がつながる
+        self.pen_paused = ratio > on_ratio + PINCH_PAUSE_MARGIN
+
+        # ピンチ（つまみ）判定：1フレームだけの揺れで切り替わらないよう比をならしてから判定
+        self.ratio = ratio if self.ratio is None else PINCH_SMOOTHING * ratio + (1 - PINCH_SMOOTHING) * self.ratio
+        ratio = self.ratio
         if ratio < on_ratio:
             self.on_count += 1
             self.off_count = 0
@@ -264,27 +282,30 @@ class HandTrack:
 
 
 def detect_hands(landmarker, frame_rgb, timestamp_ms):
-    """各手の (指先のピクセル座標, ピンチ比) を返す。
-    ピンチ比は親指-人差し指の3D距離 / 手のひらの大きさ。奥行きも見るので、
-    カメラから見て指が重なっただけではつまんだと判定されない。
+    """各手の (ペン先のピクセル座標, ピンチ比) を返す。
+    ペン先は親指と人差し指の指先の中点。人差し指の先だけを使うと、つまみを離すときに
+    指先が大きく動いて余計な線が描かれるため。
+    ピンチ比は親指-人差し指の距離 / 手のひらの大きさ。画像上の位置に推定の奥行き z を
+    加えた3D距離で測るので、カメラから見て指が重なっただけではつまんだと判定されない。
+    （hand_world_landmarks は手を横向きにすると奥行きが崩れ、つまんでも離れていると出る）
     """
     h, w = frame_rgb.shape[:2]
     image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
     result = landmarker.detect_for_video(image, timestamp_ms)
     dets = []
-    for lms, world in zip(result.hand_landmarks, result.hand_world_landmarks):
-        p3 = lambda i: np.array([world[i].x, world[i].y, world[i].z])
-        palm = max(np.linalg.norm(p3(WRIST) - p3(MIDDLE_MCP)), 1e-6)
+    for lms in result.hand_landmarks:
+        p3 = lambda i: np.array([lms[i].x * w, lms[i].y * h, lms[i].z * w])  # z は x と同じ尺度
+        palm = max(np.linalg.norm(p3(WRIST) - p3(MIDDLE_MCP)), 1.0)
         ratio = np.linalg.norm(p3(THUMB_TIP) - p3(INDEX_TIP)) / palm
-        dets.append((np.array([lms[INDEX_TIP].x * w, lms[INDEX_TIP].y * h]), ratio))
+        dets.append(((p3(THUMB_TIP)[:2] + p3(INDEX_TIP)[:2]) / 2, ratio))
     return dets
 
 
 def match_tracks(tracks, dets, frame_w, next_id):
-    """指先どうしが近い順に、追跡中の手と検出結果を対応づける"""
+    """速度から予測したペン先位置と近い順に、追跡中の手と検出結果を対応づける"""
     max_dist = MATCHING_DISTANCE * frame_w
     pairs = sorted(
-        (np.linalg.norm(tr.tip - det[0]), tid, di)
+        (np.linalg.norm(tr.tip + tr.vel * (tr.missed + 1) - det[0]), tid, di)
         for tid, tr in tracks.items() for di, det in enumerate(dets)
     )
     assigned = {}
@@ -429,7 +450,7 @@ class Overlay:
         cv2.circle(frame, pt, self.px(15), (255, 255, 255), self.px(1), cv2.LINE_AA)
         cv2.circle(frame, pt, self.px(13), color, self.px(2), cv2.LINE_AA)
         if track.hover is not None and not track.hover_done:
-            # とどまっている間、指先のまわりにリングが満ちていく
+            # とどまっている間、ペン先のまわりにリングが満ちていく
             dwell = CLEAR_DWELL_SEC if track.hover == CLEAR else SELECT_DWELL_SEC
             progress = min(1.0, (now - track.hover_start) / dwell)
             r = self.px(22)
@@ -606,12 +627,14 @@ def main():
                 pt = tr.point()
 
                 # 描画：ピンチ中かつパレット外なら、前の点から線を伸ばす
+                # （指が開きかけている間は伸ばさず、最終点だけ保つ）
                 if tr.pinched and not ui.in_area(pt):
                     if tr.last_pt is None:
                         tr.last_pt = pt
-                    else:
+                    elif not tr.pen_paused:
                         d = math.dist(pt, tr.last_pt)
-                        if d > ui.px(MAX_STROKE_JUMP_PX):
+                        # 数フレーム見失っていた分は動いていて当然なので、その分だけ許容する
+                        if d > ui.px(MAX_STROKE_JUMP_PX) * tr.gap:
                             tr.last_pt = pt
                         elif d >= ui.px(MIN_POINT_DIST_PX):
                             thickness = ui.px(DRAW_THICKNESS)
@@ -621,7 +644,7 @@ def main():
                 else:
                     tr.last_pt = None
 
-                # パレット：ピンチしていない指先がとどまったら選択
+                # パレット：ピンチしていないペン先がとどまったら選択
                 item = None if tr.pinched else ui.hit(pt)
                 if item != tr.hover:
                     tr.hover, tr.hover_start, tr.hover_done = item, now, False
