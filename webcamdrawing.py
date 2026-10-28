@@ -55,9 +55,7 @@ from PIL import Image, ImageDraw, ImageFont
 WINDOW_NAME = "WebCam Drawing"
 COLORS = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (0, 255, 255)]  # BGR: 青 緑 赤 黄
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-# PyInstaller でビルドした exe では同梱ファイルの展開先から読む
-APP_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(APP_DIR, "hand_landmarker.task")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 IS_WINDOWS = platform.system() == "Windows"
 # 日本語を表示できるフォント（最初に見つかったもの）
 FONT_CANDIDATES = [
@@ -143,46 +141,6 @@ def camera_names():
         return FilterGraph().get_input_devices()
     except Exception:
         return []
-
-
-def choose_camera(names):
-    """カメラ名のボタンを並べたウィンドウで選ばせる。閉じられたら None"""
-    if len(names) <= 1:
-        return 0
-    import tkinter as tk
-    root = tk.Tk()
-    root.title(WINDOW_NAME)
-    root.resizable(False, False)
-    chosen = []
-
-    def pick(i):
-        chosen.append(i)
-        root.destroy()
-
-    buttons = []
-    for i, name in enumerate(names):
-        b = tk.Button(root, text=name, width=36, pady=6, command=lambda i=i: pick(i))
-        b.pack(fill="x", padx=12, pady=(12 if i == 0 else 0, 12 if i == len(names) - 1 else 6))
-        buttons.append(b)
-    # キーボードでも選べる：Tab/↑↓で移動、Enterで決定、Escで閉じる
-    root.bind("<Return>", lambda e: root.focus_get().invoke())
-    root.bind("<Down>", lambda e: root.focus_get().tk_focusNext().focus_set())
-    root.bind("<Up>", lambda e: root.focus_get().tk_focusPrev().focus_set())
-    root.bind("<Escape>", lambda e: root.destroy())
-    root.eval("tk::PlaceWindow . center")
-    root.after(0, root.focus_force)
-    buttons[0].focus_set()
-    root.mainloop()
-    return chosen[0] if chosen else None
-
-
-def show_error(message):
-    import tkinter as tk
-    from tkinter import messagebox
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showerror(WINDOW_NAME, message)
-    root.destroy()
 
 
 class Camera:
@@ -478,13 +436,95 @@ class Overlay:
             cv2.ellipse(frame, pt, (r, r), -90, 0, 360 * progress, (255, 255, 255), self.px(4), cv2.LINE_AA)
 
 
-# ====== メイン ======
+# ====== 起動画面・ダイアログ ======
 def screen_size():
     if not IS_WINDOWS:
         return None
     import ctypes
     user32 = ctypes.windll.user32
     return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+
+def letterbox(frame, size):
+    """縦横比を保ったままウィンドウの大きさに合わせ、余白を黒で埋める
+    （Windows の OpenCV は WINDOW_KEEPRATIO が効かず、映像が引き伸ばされるため）
+    """
+    ww, wh = size
+    h, w = frame.shape[:2]
+    if ww <= 0 or wh <= 0 or (ww, wh) == (w, h):
+        return frame
+    s = min(ww / w, wh / h)
+    nw, nh = max(1, round(w * s)), max(1, round(h * s))
+    out = np.zeros((wh, ww, 3), np.uint8)
+    x, y = (ww - nw) // 2, (wh - nh) // 2
+    out[y:y + nh, x:x + nw] = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+    return out
+
+
+def dpi_scale():
+    if not IS_WINDOWS:
+        return 1.0
+    import ctypes
+    try:
+        return ctypes.windll.user32.GetDpiForSystem() / 96
+    except AttributeError:
+        return 1.0
+
+
+def show_error(message):
+    if IS_WINDOWS:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, message, WINDOW_NAME, 0x10)  # MB_ICONERROR
+    else:
+        print(message, file=sys.stderr)
+
+
+def choose_camera(names):
+    """カメラ名のボタンを並べた画面で選ばせる（クリック / ↑↓+Enter）。閉じられたら None"""
+    if len(names) <= 1:
+        return 0
+    px = lambda v: round(v * dpi_scale())
+    bw, bh, gap, size = px(480), px(44), px(10), px(18)
+    w, h = bw + 2 * gap, gap + len(names) * (bh + gap)
+    state = {"hover": 0, "picked": None}
+
+    def on_mouse(event, x, y, flags, param):
+        i, dy = divmod(y - gap, bh + gap)
+        if 0 <= i < len(names) and dy < bh and gap <= x < gap + bw:
+            state["hover"] = i
+            if event == cv2.EVENT_LBUTTONUP:
+                state["picked"] = i
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    screen = screen_size()
+    if screen:
+        cv2.moveWindow(WINDOW_NAME, (screen[0] - w) // 2, (screen[1] - h) // 2)
+    text_h = text_sprite("高", size)[1].shape[0]
+    while state["picked"] is None:
+        img = np.full((h, w, 3), 32, np.uint8)
+        for i, name in enumerate(names):
+            y = gap + i * (bh + gap)
+            hover = i == state["hover"]
+            cv2.rectangle(img, (gap, y), (gap + bw, y + bh), (85, 85, 85) if hover else (55, 55, 55), -1)
+            if hover:
+                cv2.rectangle(img, (gap, y), (gap + bw, y + bh), (255, 255, 255), px(2))
+            draw_text(img, name, size, gap + px(14), y + (bh - text_h) // 2)
+        cv2.imshow(WINDOW_NAME, img)
+        key = cv2.waitKeyEx(20)
+        if key in KEYS_UP:
+            state["hover"] = (state["hover"] - 1) % len(names)
+        elif key in KEYS_DOWN:
+            state["hover"] = (state["hover"] + 1) % len(names)
+        elif key in (13, 32):  # Enter / Space で決定
+            state["picked"] = state["hover"]
+        elif key == 27 or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            break
+    cv2.destroyWindow(WINDOW_NAME)
+    return state["picked"]
+
+
+# ====== メイン ======
 
 
 def main():
@@ -600,6 +640,8 @@ def main():
             ui.draw_status(frame, pinch_level, camera_label())
             for tid in matched:
                 ui.draw_cursor(frame, tracks[tid], draw_color, now)
+            if shown:
+                frame = letterbox(frame, cv2.getWindowImageRect(WINDOW_NAME)[2:])
             cv2.imshow(WINDOW_NAME, frame)
             if not shown:
                 # 最初の表示で、画面に収まる大きさにウィンドウを合わせる
@@ -642,3 +684,8 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # コンソールなし (pythonw) で起動していても原因がわかるようにダイアログで出す
+        import traceback
+        show_error(traceback.format_exc())
+        sys.exit(1)

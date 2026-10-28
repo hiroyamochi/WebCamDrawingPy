@@ -1,4 +1,4 @@
-# v* のタグを push すると Windows 版をビルドして GitHub Release に置く
+# v* のタグを push すると Windows 版の exe を作って GitHub Release に置く
 name: Release
 
 on:
@@ -18,19 +18,10 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller==6.22.3
-
-      - name: Download hand landmark model
-        run: curl -L -o hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
-
       - name: Build
-        run: pyinstaller --noconfirm WebCamDrawing.spec
-
-      - name: Package
-        run: Compress-Archive -Path dist/WebCamDrawing -DestinationPath WebCamDrawing-${{ github.ref_name }}-windows.zip
+        run: .\build.ps1 -Version ${{ github.ref_name }}
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create ${{ github.ref_name }} WebCamDrawing-${{ github.ref_name }}-windows.zip --title ${{ github.ref_name }} --generate-notes
+        run: gh release create ${{ github.ref_name }} dist/WebCamDrawing-${{ github.ref_name }}-windows.exe --title ${{ github.ref_name }} --generate-notes
