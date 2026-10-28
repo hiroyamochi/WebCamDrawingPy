@@ -1,2 +1,8 @@
+__pycache__/
+*.py[cod]
+/venv/
+/.venv/
+/hand_landmarker.task
 /test.py
-/venv
+/build/
+/dist/
